@@ -72,6 +72,8 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q4_0 = 2,  // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q4_1 = 3,  // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q4_1_SOME_F16 = 4, // tok_embeddings.weight and output.weight are F16
+        LLAMA_FTYPE_MOSTLY_Q2_0 = 5,
+        LLAMA_FTYPE_MOSTLY_Q3_0 = 6,
     };
 
     LLAMA_API struct llama_context_params llama_context_default_params();
