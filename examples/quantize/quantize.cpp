@@ -10,7 +10,11 @@
 int main(int argc, char ** argv) {
     ggml_time_init();
 
-    if (argc != 4) {
+    if (argc == 3) {
+        fprintf(stderr, "usage: %s model-f32.bin model-quant.bin type\n", argv[0]);
+        fprintf(stderr, "Assuming you just want statistics\n");
+    }
+    else if (argc != 4) {
         fprintf(stderr, "usage: %s model-f32.bin model-quant.bin type\n", argv[0]);
         fprintf(stderr, "  type = 2 - q4_0\n");
         fprintf(stderr, "  type = 3 - q4_1\n");
@@ -25,9 +29,9 @@ int main(int argc, char ** argv) {
     }
 
     const std::string fname_inp = argv[1];
-    const std::string fname_out = argv[2];
+    const std::string fname_out = (argc == 4) ? argv[2] : "";
 
-    const int itype = atoi(argv[3]);
+    const int itype = atoi(argv[argc - 1]);
 
     const int64_t t_main_start_us = ggml_time_us();
 

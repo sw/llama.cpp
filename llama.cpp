@@ -1287,6 +1287,27 @@ static llama_vocab::id llama_sample_top_p_top_k(
 // quantization
 //
 
+#include "ggml_internal.h"
+
+struct error_stats {
+    size_t num_samples;
+    double total_error;
+    double max_error;
+};
+
+static void update_error_stats(int64_t nelements, const float * input, const float * output, error_stats & stats) {
+    for (int64_t i = 0; i < nelements; i++) {
+        double diff = input[i] - output[i];
+        stats.total_error += diff * diff;
+        stats.max_error = fmax(fabs(diff), stats.max_error);
+    }
+    stats.num_samples += nelements;
+}
+
+static void print_error_stats(const std::string & name, const error_stats & stats) {
+    printf("%-50s: mse %.8f, maxerr %.8f\n", name.c_str(), stats.total_error / (double) stats.num_samples, stats.max_error);
+}
+
 // TODO: reuse code from the llama_model_load() somehow
 static bool llama_model_quantize_internal(const std::string & fname_inp, const std::string & fname_out, int itype) {
     ggml_type type = GGML_TYPE_Q4_1;
@@ -1312,10 +1333,17 @@ static bool llama_model_quantize_internal(const std::string & fname_inp, const s
         return false;
     }
 
-    auto fout = std::ofstream(fname_out, std::ios::binary);
-    if (!fout) {
-        fprintf(stderr, "%s: failed to open '%s' for writing\n", __func__, fname_out.c_str());
-        return false;
+    bool stats = fname_out.empty();
+    error_stats total_error {};
+    std::vector<float> output_scratch;
+
+    std::ofstream fout;
+    if (!stats) {
+        fout.open(fname_out, std::ios::binary);
+        if (!fout) {
+            fprintf(stderr, "%s: failed to open '%s' for writing\n", __func__, fname_out.c_str());
+            return false;
+        }
     }
 
     // verify magic
@@ -1549,6 +1577,15 @@ static bool llama_model_quantize_internal(const std::string & fname_inp, const s
                     printf("%5.3f ", hist_cur[i] / float(nelements));
                 }
                 printf("\n");
+
+                if (stats && !std::regex_match(name, std::regex("norm"))) {
+                    quantize_fns_t qfns = ggml_internal_get_quantize_fn(type);
+                    #define QK 32
+                    assert(nelements % QK == 0);
+                    output_scratch.resize(nelements);
+                    qfns.dequantize_row_q(work.data(), output_scratch.data(), nelements);
+                    update_error_stats(nelements, data_f32.data(), output_scratch.data(), total_error);
+                }
             } else {
                 printf("size = %8.3f MB\n", data_u8.size()/1024.0/1024.0);
                 fout.write(reinterpret_cast<char *>(data_u8.data()), data_u8.size());
@@ -1577,6 +1614,11 @@ static bool llama_model_quantize_internal(const std::string & fname_inp, const s
 
     finp.close();
     fout.close();
+
+    if (stats) {
+        static const char * ggml_type_str[] = { "q4_0", "q4_1", };
+        print_error_stats(ggml_type_str[type], total_error);
+    }
 
     return true;
 }
