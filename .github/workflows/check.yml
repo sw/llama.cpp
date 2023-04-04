@@ -1,0 +1,44 @@
+name: Check
+
+on:
+  workflow_dispatch: # allows manual triggering
+  push:
+    paths: ['.github/workflows/**', '**/*.h', '**/*.c', '**/*.cpp']
+  pull_request:
+    types: [opened]
+    paths: ['**/*.h', '**/*.c', '**/*.cpp']
+
+env:
+ BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+
+jobs:
+  lint-diffs:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v1
+
+      - name: Dependencies
+        id: depends
+        run: |
+          sudo apt-get update
+          sudo apt-get install cpplint flake8 pylint shellcheck
+          pip install lint-diffs
+
+      - name: Check
+        id: check
+        run: |
+          cat <<EOF > .lint-diffs
+          [cpplint]
+          extensions=.c .cpp .h
+          command=cpplint
+
+          [flake8]
+          extensions=.py
+
+          [clang-tidy]
+          extensions=
+          EOF
+          git diff --unified=0 origin/master | lint-diffs --debug

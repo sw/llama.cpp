@@ -6855,7 +6855,7 @@ static void ggml_compute_forward_scale(
 
 // ggml_compute_forward_cpy
 
-static void ggml_compute_forward_cpy(
+ static void ggml_compute_forward_cpy(
         const struct ggml_compute_params * params,
         const struct ggml_tensor * src0,
         struct ggml_tensor * dst) {
