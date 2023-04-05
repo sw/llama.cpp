@@ -6889,7 +6889,7 @@ static void ggml_compute_forward_mul_mat_q_f32(
     const int64_t ne1  = dst->ne[1];
     const int64_t ne2  = dst->ne[2];
     const int64_t ne3  = dst->ne[3];
-    const int ne   = ne0*ne1*ne2*ne3;
+    const int64_t ne   = ne0*ne1*ne2*ne3;
 
     const int nb00 = src0->nb[0];
     const int nb01 = src0->nb[1];
@@ -6959,8 +6959,8 @@ static void ggml_compute_forward_mul_mat_q_f32(
             for (int64_t i02 = 0; i02 < ne02; i02++) {
                 {
                     size_t id = 0;
-                    for (int i01 = 0; i01 < ne01; ++i01) {
-                        dequantize_row_q4_1((char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01, wdata + id, ne00);
+                    for (int64_t i01 = 0; i01 < ne01; ++i01) {
+                        dequantize_row_q((char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01, wdata + id, ne00);
                         id += ne00;
                     }
                 }
@@ -6990,9 +6990,9 @@ static void ggml_compute_forward_mul_mat_q_f32(
             char * wdata = params->wdata;
             const size_t row_size = ne10*GGML_TYPE_SIZE[type]/GGML_BLCK_SIZE[type];
 
-            for (int i13 = 0; i13 < ne13; ++i13) {
-                for (int i12 = 0; i12 < ne12; ++i12) {
-                    for (int i11 = 0; i11 < ne11; ++i11) {
+            for (int64_t i13 = 0; i13 < ne13; ++i13) {
+                for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                    for (int64_t i11 = 0; i11 < ne11; ++i11) {
                         quantize_row_q((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11), (void *) wdata, ne10);
                         wdata += row_size;
                     }
@@ -7046,7 +7046,7 @@ static void ggml_compute_forward_mul_mat_q_f32(
         const int ir1 = MIN(ir0 + dr, nr);
 
         void * wdata = params->wdata;
-    const size_t row_size = ne00*GGML_TYPE_SIZE[type]/GGML_BLCK_SIZE[type];
+        const size_t row_size = ne00*GGML_TYPE_SIZE[type]/GGML_BLCK_SIZE[type];
 
         for (int ir = ir0; ir < ir1; ++ir) {
             // src0 indices
@@ -7068,7 +7068,7 @@ static void ggml_compute_forward_mul_mat_q_f32(
 
             assert(ne00 % 32 == 0);
 
-            for (int ic = 0; ic < ne11; ++ic) {
+            for (int64_t ic = 0; ic < ne11; ++ic) {
                 vec_dot_q(ne00, &dst_col[ic*ne0], src0_row, (void *) (src1_col + ic*row_size));
             }
         }
@@ -9739,8 +9739,7 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                             cur = ggml_nbytes(node)*node->n_tasks; // TODO: this can become (n_tasks-1)
                                                                    // TODO: overestimated by factor of x2 for FP16
                         } else {
-                            if (node->src0->type == GGML_TYPE_F16 &&
-                                node->src1->type == GGML_TYPE_F32) {
+                            if (node->src0->type == GGML_TYPE_F16 && node->src1->type == GGML_TYPE_F32) {
 #if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS)
                                 if (ggml_compute_forward_mul_mat_use_blas(node->src0, node->src1, node)) {
                                     node->n_tasks = 1; // TODO: this actually is doing nothing
