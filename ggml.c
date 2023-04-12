@@ -1809,14 +1809,13 @@ inline static void ggml_vec_dot_f16(const int n, float * restrict s, ggml_fp16_t
     *s = sumf;
 }
 
-static void ggml_vec_dot_q4_0(const int n, float * restrict s, const void * restrict vx, const void * restrict vy) {
+static void ggml_vec_dot_q4_0(const int n, float * restrict s, const void * restrict vx, const float * restrict y) {
     const int nb = n / QK;
 
     assert(n % QK == 0);
     assert(nb % 2 == 0);
 
     const block_q4_0 * restrict x = vx;
-    const block_q4_0 * restrict y = vy;
 
     float sumf = 0.0;
 
@@ -1946,67 +1945,33 @@ static void ggml_vec_dot_q4_0(const int n, float * restrict s, const void * rest
     // Initialize accumulator with zeros
     __m256 acc = _mm256_setzero_ps();
 
-    /* Prepare the constants we will need during execution */
-    const __m256i lowMask = _mm256_set1_epi8( 0xF );
-    const __m256i offset_8 = _mm256_set1_epi16( 8 );
-
-#define UNROLL_COUNT 8
-    // make sure we only unroll multiples of the block count
-    assert(nb % UNROLL_COUNT == 0);
-
     // Main loop
-    for (int i = 0; i < nb; i+=UNROLL_COUNT) {
-        // This loop will be unrolled by the compiler
-        for (int u=0;u<UNROLL_COUNT;u++)  {
-            /* Compute combined scale for the block */
-            const __m256 scale = _mm256_mul_ps(
-                    _mm256_broadcast_ss( &x[i+u].d ),
-                    _mm256_broadcast_ss( &y[i+u].d ) );
+    for (int i = 0; i < nb; i++) {
+        // scale factor
+        const __m256 d_v = _mm256_broadcast_ss(&x[i].d);
 
-            /* get input from x
-               Input: 32 Nibbles (16 bytes) at *x[i+u]
-               Output: 2 vectors with 16 values of type int16_t (x_high_q, x_low_q) */
+        // Load 32x4-bit integers into 32x8-bit integers
+        __m256i vx8 = bytesFromNibbles(x[i].qs);
 
-            /* Load 16 bytes from memory */
-            const __m128i tmp_x = _mm_loadu_si128( ( const __m128i* ) x[i+u].qs);
-            /* Expand bytes into uint16_t values */
-            const __m256i bytes_x = _mm256_cvtepu8_epi16(tmp_x);
-            /* Unpack values into individual bytes */
-            __m256i x_low_q = _mm256_and_si256( lowMask, bytes_x );
-            const __m256i pre_shift_x_high_q = _mm256_andnot_si256( lowMask, bytes_x );
-            __m256i x_high_q = _mm256_srli_epi16( pre_shift_x_high_q, 4 );
-            /* Now we have two vectors with bytes in [ 0 .. 15 ] interval.  Offset them into [ -8 .. +7 ] interval.  */
-            x_high_q = _mm256_sub_epi16( x_high_q, offset_8 );
-            x_low_q = _mm256_sub_epi16( x_low_q, offset_8 );
+        // Subtract 8 from the integers
+        vx8 = _mm256_sub_epi8(vx8, _mm256_set1_epi8(8));
 
-            /* get input from y
-               Input: 32 Nibbles (16 bytes) at *y[i+u]
-               Output: 2 vectors with 16 values of type int16_t (y_high_q, y_low_q) */
+        // Convert to 16-bit int
+        const __m256i vx16_lo = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vx8, 0));
+        const __m256i vx16_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vx8, 1));
 
-            /* Load 16 bytes from memory */
-            const __m128i tmp_y = _mm_loadu_si128( (const __m128i* ) y[i+u].qs);
-            /* Expand bytes into uint16_t values */
-            const __m256i bytes_y = _mm256_cvtepu8_epi16(tmp_y);
-            /* Unpack values into individual bytes */
-            const __m256i pre_shift_y_high_q = _mm256_andnot_si256( lowMask, bytes_y );
-            __m256i y_high_q = _mm256_srli_epi16( pre_shift_y_high_q, 4 );
-            __m256i y_low_q = _mm256_and_si256( lowMask, bytes_y );
-            /* Now we have two vectors with bytes in [ 0 .. 15 ] interval.  Offset them into [ -8 .. +7 ] interval.  */
-            y_high_q = _mm256_sub_epi16( y_high_q, offset_8 );
-            y_low_q = _mm256_sub_epi16( y_low_q, offset_8 );
+        // Convert to 32-bit int -> float 32
+        const __m256 vf[4] = {
+            _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(vx16_lo, 0))),
+            _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(vx16_lo, 1))),
+            _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(vx16_hi, 0))),
+            _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(vx16_hi, 1)))
+        };
 
-            /* Compute products of int16_t integers, add pairwise, store as int32_t */
-            __m256i xy_high_q = _mm256_madd_epi16( x_high_q, y_high_q );
-            __m256i xy_low_q = _mm256_madd_epi16( x_low_q, y_low_q );
-
-            /* Accumulate the products of int32_t integers -> we now have a vector of 8 int_32t */
-            __m256i xy_q = _mm256_add_epi32( xy_high_q, xy_low_q );
-
-            /* Convert to vectore of 8 int32_t to 8 floats */
-            __m256 q = _mm256_cvtepi32_ps( xy_q );
-
-            /* Multiply q with scale and accumulate */
-            acc = _mm256_fmadd_ps( scale, q, acc );
+        for (int j = 0; j < 4; j++) {
+            const __m256 xs = _mm256_mul_ps(vf[j], d_v);
+            const __m256 ys = _mm256_load_ps(y + i * QK + j*8);
+            acc = _mm256_fmadd_ps(xs, ys, acc);
         }
     }
 
@@ -2146,21 +2111,17 @@ static void ggml_vec_dot_q4_0(const int n, float * restrict s, const void * rest
 #else
     // scalar
     for (int i = 0; i < nb; i++) {
-        const float d0 = x[i].d;
-        const float d1 = y[i].d;
+        const float d = x[i].d;
+        const uint8_t * restrict pp = x[i].qs;
 
-        const uint8_t * restrict p0 = x[i].qs;
-        const uint8_t * restrict p1 = y[i].qs;
+        for (int l = 0; l < QK; l += 2) {
+            const uint8_t vi = pp[l/2];
 
-        for (int j = 0; j < QK/2; j++) {
-            const uint8_t v0 = p0[j];
-            const uint8_t v1 = p1[j];
+            const float f0 = d*((int8_t) (vi & 0xf) - 8);
+            const float f1 = d*((int8_t) (vi >> 4)  - 8);
 
-            const float f0 = d0*((int8_t) (v0 & 0xf) - 8);
-            const float f1 = d0*((int8_t) (v0 >> 4)  - 8);
-
-            const float f2 = d1*((int8_t) (v1 & 0xf) - 8);
-            const float f3 = d1*((int8_t) (v1 >> 4)  - 8);
+            const float f2 = y[i*QK + l + 0];
+            const float f3 = y[i*QK + l + 1];
 
             sumf += f0*f2 + f1*f3;
         }
@@ -2170,76 +2131,42 @@ static void ggml_vec_dot_q4_0(const int n, float * restrict s, const void * rest
     *s = sumf;
 }
 
-static void ggml_vec_dot_q4_1(const int n, float * restrict s, const void * restrict vx, const void * restrict vy) {
+static void ggml_vec_dot_q4_1(const int n, float * restrict s, const void * restrict vx, const float * restrict y) {
     const int nb = n / QK;
 
     const block_q4_1 * restrict x = vx;
-    const block_q4_1 * restrict y = vy;
 
     float sumf = 0.0;
 
 #if defined(__AVX2__)
     // Initialize accumulator with zeros
     __m256 acc = _mm256_setzero_ps();
-    // Accumulator for constant offsets
-    float acc_offset = 0.0f;
 
     // Main loop
     for (int i = 0; i < nb; ++i) {
-        const float * d0 = &x[i].d;
-        const float * d1 = &y[i].d;
+        const __m256 d_v = _mm256_broadcast_ss(&x[i].d);
+        const __m256 d_m = _mm256_broadcast_ss(&x[i].m);
 
-        const float * m0 = &x[i].m;
-        const float * m1 = &y[i].m;
+        // Load 32x4-bit integers into 32x8-bit integers
+        __m256i vx8 = bytesFromNibbles(x[i].qs);
 
-        const __m256 d0v = _mm256_broadcast_ss( d0 );
-        const __m256 d1v = _mm256_broadcast_ss( d1 );
-        const __m256 m0v = _mm256_broadcast_ss( m0 );
-        const __m256 m1v = _mm256_broadcast_ss( m1 );
+        // Convert to 16-bit int
+        const __m256i vx16_lo = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vx8, 0));
+        const __m256i vx16_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vx8, 1));
 
-        // Compute combined scale for the block
-        const __m256 scale_01 = _mm256_mul_ps( d0v, d1v );
+        // Convert to 32-bit int -> float 32
+        const __m256 vf[4] = {
+            _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(vx16_lo, 0))),
+            _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(vx16_lo, 1))),
+            _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(vx16_hi, 0))),
+            _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(vx16_hi, 1)))
+        };
 
-        // Compute cross scales for the block
-        const __m256 scale_0 = _mm256_mul_ps( d0v, m1v );
-        const __m256 scale_1 = _mm256_mul_ps( m0v, d1v );
-        const __m256 cross_scales = _mm256_blend_ps( scale_0, scale_1, 0xAA /* 0b10101010 */ );
-
-        // Load 16 bytes, and unpack 4 bit fields into bytes, making 32 bytes
-        __m256i bx = bytesFromNibbles( x[i].qs );
-        __m256i by = bytesFromNibbles( y[i].qs );
-
-        // Now we have a vector with bytes in [ 0 .. 15 ] interval.
-
-        // Sign-extend first 16 signed bytes into int16_t
-        __m256i x16 = _mm256_cvtepi8_epi16( _mm256_castsi256_si128( bx ) );
-        __m256i y16 = _mm256_cvtepi8_epi16( _mm256_castsi256_si128( by ) );
-        // Compute products of int16_t integers, add pairwise
-        __m256i i32 = _mm256_madd_epi16( x16, y16 );
-
-        // Sign-extend last 16 signed bytes into int16_t vectors
-        __m256i x16_h = _mm256_cvtepi8_epi16( _mm256_extracti128_si256( bx, 1 ) );
-        __m256i y16_h = _mm256_cvtepi8_epi16( _mm256_extracti128_si256( by, 1 ) );
-        // Accumulate products of int16_t integers
-        i32 = _mm256_add_epi32( i32, _mm256_madd_epi16( x16_h, y16_h ) );
-
-        // compute sums of unsigned bytes in bx, by in blocks of 8.
-        // This results in a layout like X100 0000 X200 0000 X300 0000 X400 0000,
-        // which we then interleave as X100 Y100 X200 Y200 X300 Y300 X400 Y400.
-        // so if we then cast to 8 singles, we get 8 floats like [ x0_7, y0_7, x8_15, y8_15, x16_23, y16_23, x24_31, y24_31 ]
-        __m256i xsumi = _mm256_sad_epu8( bx, _mm256_setzero_si256() );
-        __m256i ysumi = _mm256_sad_epu8( by, _mm256_setzero_si256() );
-        __m256i sumsi = _mm256_or_si256( xsumi, _mm256_slli_si256( ysumi, 4 ) );
-        __m256  sums  = _mm256_cvtepi32_ps( sumsi );
-
-        // Convert int32_t to float
-        __m256 p = _mm256_cvtepi32_ps( i32 );
-        // Apply the scale, and accumulate
-        // acc += d0*d1*x*y + d0*m1*x + d1*m0*y
-        acc = _mm256_fmadd_ps( scale_01, p, acc );
-        acc = _mm256_fmadd_ps( cross_scales, sums, acc );
-        // acc_offset += m0*m1 (for each entry in the block)
-        acc_offset += (*m0)*(*m1);
+        for (int j = 0; j < 4; j++) {
+            const __m256 xs = _mm256_add_ps(_mm256_mul_ps(vf[j], d_v), d_m);
+            const __m256 ys = _mm256_load_ps(y + i * QK + j*8);
+            acc = _mm256_fmadd_ps(xs, ys, acc);
+        }
     }
 
     // Return horizontal sum of the acc vector
@@ -2248,7 +2175,7 @@ static void ggml_vec_dot_q4_1(const int n, float * restrict s, const void * rest
     res = _mm_add_ps( res, _mm_movehl_ps( res, res ) );
     res = _mm_add_ss( res, _mm_movehdup_ps( res ) );
 
-    sumf = _mm_cvtss_f32( res ) + acc_offset * QK;
+    sumf = _mm_cvtss_f32( res );
 #elif defined(__ARM_NEON)
     float sum00 = 0.0f;
     float sum01 = 0.0f;
@@ -2291,24 +2218,22 @@ static void ggml_vec_dot_q4_1(const int n, float * restrict s, const void * rest
 #else
     // scalar
     for (int i = 0; i < nb; i++) {
-        const float d0 = x[i].d;
-        const float d1 = y[i].d;
+        const float d = x[i].d;
+        const float m = x[i].m;
 
-        const float m0 = x[i].m;
-        const float m1 = y[i].m;
+        const uint8_t * restrict pp = x[i].qs;
 
-        const uint8_t * restrict p0 = x[i].qs;
-        const uint8_t * restrict p1 = y[i].qs;
+        for (int l = 0; l < QK; l += 2) {
+            const uint8_t vi = pp[l/2];
 
-        for (int j = 0; j < QK/2; j++) {
-            const uint8_t v0 = p0[j];
-            const uint8_t v1 = p1[j];
+            const int8_t vi0 = vi & 0xf;
+            const int8_t vi1 = vi >> 4;
 
-            const float f0 = d0*(v0 & 0xf) + m0;
-            const float f1 = d0*(v0 >> 4)  + m0;
+            const float f0 = vi0*d + m;
+            const float f1 = vi1*d + m;
 
-            const float f2 = d1*(v1 & 0xf) + m1;
-            const float f3 = d1*(v1 >> 4)  + m1;
+            const float f2 = y[i*QK + l + 0];
+            const float f3 = y[i*QK + l + 1];
 
             sumf += f0*f2 + f1*f3;
         }
@@ -6729,7 +6654,6 @@ static void ggml_compute_forward_mul_mat_q_f32(
     const int64_t ne02 = src0->ne[2];
     const int64_t ne03 = src0->ne[3];
 
-    const int64_t ne10 = src1->ne[0];
     const int64_t ne11 = src1->ne[1];
     const int64_t ne12 = src1->ne[2];
     const int64_t ne13 = src1->ne[3];
@@ -6745,7 +6669,6 @@ static void ggml_compute_forward_mul_mat_q_f32(
     const int nb03 = src0->nb[3];
 
     const int nb10 = src1->nb[0];
-    const int nb11 = src1->nb[1];
     const int nb12 = src1->nb[2];
     const int nb13 = src1->nb[3];
 
@@ -6763,7 +6686,6 @@ static void ggml_compute_forward_mul_mat_q_f32(
     GGML_ASSERT(ne3  == ne13);
 
     const enum ggml_type type = src0->type;
-    quantize_row_q_t const quantize_row_q = quantize_fns[type].quantize_row_q;
     vec_dot_q_t      const vec_dot_q      = quantize_fns[type].vec_dot_q;
 
     // we don't support permuted src0 or src1
@@ -6832,18 +6754,6 @@ static void ggml_compute_forward_mul_mat_q_f32(
 #endif
 
     if (params->type == GGML_TASK_INIT) {
-        char * wdata = params->wdata;
-        const size_t row_size = ne10*GGML_TYPE_SIZE[type]/GGML_BLCK_SIZE[type];
-
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                    quantize_row_q((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11), (void *) wdata, ne10);
-                    wdata += row_size;
-                }
-            }
-        }
-
         return;
     }
 
@@ -6863,9 +6773,6 @@ static void ggml_compute_forward_mul_mat_q_f32(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
-    void * wdata = params->wdata;
-    const size_t row_size = ne00*GGML_TYPE_SIZE[type]/GGML_BLCK_SIZE[type];
-
     for (int ir = ir0; ir < ir1; ++ir) {
         // src0 indices
         const int i03 = ir/(ne02*ne01);
@@ -6880,14 +6787,14 @@ static void ggml_compute_forward_mul_mat_q_f32(
         const int i3 = i03;
 
         void * src0_row = (void *) ((char *) src0->data + (i01*nb01 + i02*nb02 + i03*nb03));
-        char * src1_col =          ((char *)      wdata + (      (0 + i12*ne11 + i13*ne12*ne11)*row_size));
+        float * src1_col = (float *) ((char *) src1->data + i13*nb13 + i12*nb12);
 
         float * dst_col = (float *) ((char *) dst->data + (i0*nb0 + 0*nb1 + i2*nb2 + i3*nb3));
 
         assert(ne00 % 32 == 0);
 
         for (int64_t ic = 0; ic < ne11; ++ic) {
-            vec_dot_q(ne00, &dst_col[ic*ne0], src0_row, (void *) (src1_col + ic*row_size));
+            vec_dot_q(ne00, &dst_col[ic*ne0], src0_row, src1_col + ic*ne00);
         }
     }
 
