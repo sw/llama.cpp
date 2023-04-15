@@ -2176,7 +2176,7 @@ static void ggml_vec_dot_q2_0_q8_0(const int n, float * restrict s, const void *
 
     float sumf = 0.0f;
 
-#if __AVX__
+#if defined(__AVX2__)
     // Initialize accumulator with zeros
     __m128 acc = _mm_setzero_ps();
 
@@ -2225,7 +2225,7 @@ static void ggml_vec_dot_q2_0_q8_0(const int n, float * restrict s, const void *
     sumf = _mm_cvtss_f32(res);
 #else
     for (int i = 0; i < nb; i++) {
-        const float d0 = x[i].d;
+        const float d0 = GGML_FP16_TO_FP32(x[i].d);
         const float d1 = y[i/2].d;
 
         uint_fast32_t qs0 = x[i].qs;
@@ -2256,14 +2256,13 @@ static void ggml_vec_dot_q3_0_q8_0(const int n, float * restrict s, const void *
 
     float sumf = 0.0f;
 
-#if __AVX__ || __AVX2__
+#if defined(__AVX2__)
     // Initialize accumulator with zeros
     __m128 acc = _mm_setzero_ps();
     for (int i = 0; i < nb; i++) {
         // Compute combined scale for the block
         const __m128 scale = _mm_set1_ps(GGML_FP16_TO_FP32(x[i].d) * y[i/2].d);
 
-#if __AVX2__
         const __m256i shift_l = _mm256_set_epi64x(2*3,  64, 4*3,  0);
         const __m256i shift_r = _mm256_set_epi64x( 64, 2*3,  64, 64);
 
@@ -2306,30 +2305,6 @@ static void ggml_vec_dot_q3_0_q8_0(const int n, float * restrict s, const void *
         bxx = _mm256_shuffle_epi8(bxx, shufmask);
 
         __m128i bx = _mm_or_si128(_mm256_castsi256_si128(bxx), _mm256_extracti128_si256(bxx, 1));
-#elif __AVX__
-        // same as AVX2 but using 2 x 128-bit instructions, only slightly slower
-        const __m128i shift_l0 = _mm_set_epi64x(          4*3,  0);
-        const __m128i shift_l1 = _mm_set_epi64x(2*3,  64         );
-        const __m128i shift_r1 = _mm_set_epi64x( 64, 2*3         );
-
-        __m128i bx = _mm_set1_epi64x(x[i].qs);
-
-        // shift the copies to be able to reach all values
-        __m128i bx0 = _mm_sllv_epi64(bx, shift_l0);
-        __m128i bx1 = _mm_or_si128(_mm_sllv_epi64(bx, shift_l1), _mm_srlv_epi64(bx, shift_r1));
-
-        // add to itself in masked places to shift some values left one bit
-        const __m128i doublemask = _mm_set1_epi64x(0x078000078000);
-        bx0 = _mm_add_epi64(bx0, _mm_and_si128(doublemask, bx0));
-        bx1 = _mm_add_epi64(bx1, _mm_and_si128(doublemask, bx1));
-
-        // collect 16 bytes from 256 into 128 bits
-        const __m128i shufhi = _mm_set_epi8( 5,14,-1,-1,13, 3,-1,-1, 2,11,-1,-1,10, 0,-1,-1);
-        const __m128i shuflo = _mm_set_epi8(-1,-1, 5,14,-1,-1,13, 3,-1,-1, 2,11,-1,-1,10, 0);
-        bx0 = _mm_shuffle_epi8(bx0, shuflo);
-        bx1 = _mm_shuffle_epi8(bx1, shufhi);
-        bx = _mm_or_si128(bx0, bx1);
-#endif
 
         const __m128i mask = _mm_set1_epi8(7);
         bx = _mm_and_si128(mask, bx);
