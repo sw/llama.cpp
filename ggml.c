@@ -2201,7 +2201,7 @@ inline static void ggml_vec_dot_f16(const int n, float * restrict s, ggml_fp16_t
 #if __AVX2__ || __AVX512F__
 // Computes the dot product of signed 8-bit integers packed into 256-bit vectors,
 // converting the result to 32-bit floats packed into a 256-bit vector.
-static inline __m256 dotMul256i(__m256i bx, __m256i by) {
+static inline __m256 dotMul(__m256i bx, __m256i by) {
 #  if __AVXVNNIINT8__
     // Perform multiplication and sum to 32-bit values
     const __m256i i32 = _mm256_dpbssd_epi32(bx, by, _mm256_setzero_si256());
@@ -2221,7 +2221,7 @@ static inline __m256 dotMul256i(__m256i bx, __m256i by) {
     return _mm256_cvtepi32_ps(i32);
 }
 
-// Return horizontal sum of the 32-bit floats packed into a 256-bit vector.
+// Return horizontal sum of 32-bit floats packed into a 256-bit vector.
 static inline float horizontalSum(__m256 acc) {
     __m128 res = _mm256_extractf128_ps(acc, 1);
     res = _mm_add_ps(res, _mm256_castps256_ps128(acc));
@@ -2261,7 +2261,7 @@ static void ggml_vec_dot_q2_0_q8_0(const int n, float * restrict s, const void *
         const __m256i by = _mm256_loadu_si256((const __m256i *)y[i].qs);
 
         // Do the product:
-        __m256 p = dotMul256i(bx, by);
+        __m256 p = dotMul(bx, by);
 
         // Apply the scale, and accumulate
         acc = _mm256_fmadd_ps(scale, p, acc);
@@ -2293,7 +2293,19 @@ static void ggml_vec_dot_q2_0_q8_0(const int n, float * restrict s, const void *
     *s = sumf;
 }
 
-static const uint64_t ggml_q3_table[256];
+// Lookup table used to convert q3_0 to SIMD vectors.
+// Expands the bits of an 8-bit value into a 64 bit result, turning each bit into a byte.
+// A zero bit turns into 0xFC, while a one bit turns into 0x00.
+#define B0(n) 0x ## n
+#define B1(n) B0(n ## FC), B0(n ## 00)
+#define B2(n) B1(n ## FC), B1(n ## 00)
+#define B3(n) B2(n ## FC), B2(n ## 00)
+#define B4(n) B3(n ## FC), B3(n ## 00)
+#define B5(n) B4(n ## FC), B4(n ## 00)
+#define B6(n) B5(n ## FC), B5(n ## 00)
+#define B7(n) B6(n ## FC), B6(n ## 00)
+#define B8( ) B7(     FC), B7(     00)
+static const uint64_t ggml_q3_table[256] = { B8() };
 
 static void ggml_vec_dot_q3_0_q8_0(const int n, float * restrict s, const void * restrict vx, const void * restrict vy) {
     assert(n % QK3_0 == 0);
@@ -2309,26 +2321,27 @@ static void ggml_vec_dot_q3_0_q8_0(const int n, float * restrict s, const void *
     // Initialize accumulator with zeros
     __m256 acc = _mm256_setzero_ps();
 
-    for (int i = 0; i < nb; i += 2) {
-        __m256i const bxhi = _mm256_set_epi64x(
-            ggml_q3_table[x[i+1].qhi >> 8], ggml_q3_table[x[i+1].qhi & 0xFF],
-            ggml_q3_table[x[i+0].qhi >> 8], ggml_q3_table[x[i+0].qhi & 0xFF]);
+    for (int i = 0; i < nb/2; i++) {
+        __m256i bx = bytesFromCrumbs(x[i*2+1].qlo, x[i*2].qlo);
 
-        __m256i bx = bytesFromCrumbs(x[i+1].qlo, x[i].qlo);
+        __m256i const bxhi = _mm256_set_epi64x(
+            ggml_q3_table[x[i*2+1].qhi >> 8], ggml_q3_table[x[i*2+1].qhi & 0xFF],
+            ggml_q3_table[x[i*2+0].qhi >> 8], ggml_q3_table[x[i*2+0].qhi & 0xFF]);
 
         // OR the high bits (which also handles the sign):
         bx = _mm256_or_si256(bx, bxhi);
 
         // Compute combined scale for the block
-        const __m128 scale_lo = _mm_set1_ps(GGML_FP16_TO_FP32(x[i+0].d) * y[i/2].d);
-        const __m128 scale_hi = _mm_set1_ps(GGML_FP16_TO_FP32(x[i+1].d) * y[i/2].d);
-        const __m256 scale = _mm256_set_m128(scale_hi, scale_lo);
+        const __m128 scale_lo = _mm_set1_ps(GGML_FP16_TO_FP32(x[i*2+0].d));
+        const __m128 scale_hi = _mm_set1_ps(GGML_FP16_TO_FP32(x[i*2+1].d));
+        __m256 scale = _mm256_set_m128(scale_hi, scale_lo);
+        scale = _mm256_mul_ps(scale, _mm256_broadcast_ss(&y[i].d));
 
         // Load y vector
-        const __m256i by = _mm256_loadu_si256((const __m256i *)y[i/2].qs);
+        const __m256i by = _mm256_loadu_si256((const __m256i *)y[i].qs);
 
         // Do the product,
-        __m256 p = dotMul256i(bx, by);
+        __m256 p = dotMul(bx, by);
 
         // Apply the scale, and accumulate
         acc = _mm256_fmadd_ps(scale, p, acc);
@@ -11761,280 +11774,5 @@ int ggml_cpu_has_vsx(void) {
     return 0;
 #endif
 }
-
-////////////////////////////////////////////////////////////////////////////////
-
-/*
-* Lookup table used to convert q3_0 to SIMD vectors.
-* Expands the bits of an 8-bit value into a 64 bit result, turning each bit into a byte.
-* A zero bit turns into 0xFC, while a one bit turns into 0x00.
-* The code to generate this table is:
-for(int i = 0; i < 256; i++)
-{
-    uint64_t v = 0;
-    for(int j = 0; j < 8; j++)
-        if(!(i & (1 << j)))
-            v |= 0xFCul << (8 * j);
-    printf("    0x%016lX,// %i\n", v, i);
-}
-*/
-static const uint64_t ggml_q3_table[256] = {
-    0xFCFCFCFCFCFCFCFC, // 0
-    0xFCFCFCFCFCFCFC00, // 1
-    0xFCFCFCFCFCFC00FC, // 2
-    0xFCFCFCFCFCFC0000, // 3
-    0xFCFCFCFCFC00FCFC, // 4
-    0xFCFCFCFCFC00FC00, // 5
-    0xFCFCFCFCFC0000FC, // 6
-    0xFCFCFCFCFC000000, // 7
-    0xFCFCFCFC00FCFCFC, // 8
-    0xFCFCFCFC00FCFC00, // 9
-    0xFCFCFCFC00FC00FC, // 10
-    0xFCFCFCFC00FC0000, // 11
-    0xFCFCFCFC0000FCFC, // 12
-    0xFCFCFCFC0000FC00, // 13
-    0xFCFCFCFC000000FC, // 14
-    0xFCFCFCFC00000000, // 15
-    0xFCFCFC00FCFCFCFC, // 16
-    0xFCFCFC00FCFCFC00, // 17
-    0xFCFCFC00FCFC00FC, // 18
-    0xFCFCFC00FCFC0000, // 19
-    0xFCFCFC00FC00FCFC, // 20
-    0xFCFCFC00FC00FC00, // 21
-    0xFCFCFC00FC0000FC, // 22
-    0xFCFCFC00FC000000, // 23
-    0xFCFCFC0000FCFCFC, // 24
-    0xFCFCFC0000FCFC00, // 25
-    0xFCFCFC0000FC00FC, // 26
-    0xFCFCFC0000FC0000, // 27
-    0xFCFCFC000000FCFC, // 28
-    0xFCFCFC000000FC00, // 29
-    0xFCFCFC00000000FC, // 30
-    0xFCFCFC0000000000, // 31
-    0xFCFC00FCFCFCFCFC, // 32
-    0xFCFC00FCFCFCFC00, // 33
-    0xFCFC00FCFCFC00FC, // 34
-    0xFCFC00FCFCFC0000, // 35
-    0xFCFC00FCFC00FCFC, // 36
-    0xFCFC00FCFC00FC00, // 37
-    0xFCFC00FCFC0000FC, // 38
-    0xFCFC00FCFC000000, // 39
-    0xFCFC00FC00FCFCFC, // 40
-    0xFCFC00FC00FCFC00, // 41
-    0xFCFC00FC00FC00FC, // 42
-    0xFCFC00FC00FC0000, // 43
-    0xFCFC00FC0000FCFC, // 44
-    0xFCFC00FC0000FC00, // 45
-    0xFCFC00FC000000FC, // 46
-    0xFCFC00FC00000000, // 47
-    0xFCFC0000FCFCFCFC, // 48
-    0xFCFC0000FCFCFC00, // 49
-    0xFCFC0000FCFC00FC, // 50
-    0xFCFC0000FCFC0000, // 51
-    0xFCFC0000FC00FCFC, // 52
-    0xFCFC0000FC00FC00, // 53
-    0xFCFC0000FC0000FC, // 54
-    0xFCFC0000FC000000, // 55
-    0xFCFC000000FCFCFC, // 56
-    0xFCFC000000FCFC00, // 57
-    0xFCFC000000FC00FC, // 58
-    0xFCFC000000FC0000, // 59
-    0xFCFC00000000FCFC, // 60
-    0xFCFC00000000FC00, // 61
-    0xFCFC0000000000FC, // 62
-    0xFCFC000000000000, // 63
-    0xFC00FCFCFCFCFCFC, // 64
-    0xFC00FCFCFCFCFC00, // 65
-    0xFC00FCFCFCFC00FC, // 66
-    0xFC00FCFCFCFC0000, // 67
-    0xFC00FCFCFC00FCFC, // 68
-    0xFC00FCFCFC00FC00, // 69
-    0xFC00FCFCFC0000FC, // 70
-    0xFC00FCFCFC000000, // 71
-    0xFC00FCFC00FCFCFC, // 72
-    0xFC00FCFC00FCFC00, // 73
-    0xFC00FCFC00FC00FC, // 74
-    0xFC00FCFC00FC0000, // 75
-    0xFC00FCFC0000FCFC, // 76
-    0xFC00FCFC0000FC00, // 77
-    0xFC00FCFC000000FC, // 78
-    0xFC00FCFC00000000, // 79
-    0xFC00FC00FCFCFCFC, // 80
-    0xFC00FC00FCFCFC00, // 81
-    0xFC00FC00FCFC00FC, // 82
-    0xFC00FC00FCFC0000, // 83
-    0xFC00FC00FC00FCFC, // 84
-    0xFC00FC00FC00FC00, // 85
-    0xFC00FC00FC0000FC, // 86
-    0xFC00FC00FC000000, // 87
-    0xFC00FC0000FCFCFC, // 88
-    0xFC00FC0000FCFC00, // 89
-    0xFC00FC0000FC00FC, // 90
-    0xFC00FC0000FC0000, // 91
-    0xFC00FC000000FCFC, // 92
-    0xFC00FC000000FC00, // 93
-    0xFC00FC00000000FC, // 94
-    0xFC00FC0000000000, // 95
-    0xFC0000FCFCFCFCFC, // 96
-    0xFC0000FCFCFCFC00, // 97
-    0xFC0000FCFCFC00FC, // 98
-    0xFC0000FCFCFC0000, // 99
-    0xFC0000FCFC00FCFC, // 100
-    0xFC0000FCFC00FC00, // 101
-    0xFC0000FCFC0000FC, // 102
-    0xFC0000FCFC000000, // 103
-    0xFC0000FC00FCFCFC, // 104
-    0xFC0000FC00FCFC00, // 105
-    0xFC0000FC00FC00FC, // 106
-    0xFC0000FC00FC0000, // 107
-    0xFC0000FC0000FCFC, // 108
-    0xFC0000FC0000FC00, // 109
-    0xFC0000FC000000FC, // 110
-    0xFC0000FC00000000, // 111
-    0xFC000000FCFCFCFC, // 112
-    0xFC000000FCFCFC00, // 113
-    0xFC000000FCFC00FC, // 114
-    0xFC000000FCFC0000, // 115
-    0xFC000000FC00FCFC, // 116
-    0xFC000000FC00FC00, // 117
-    0xFC000000FC0000FC, // 118
-    0xFC000000FC000000, // 119
-    0xFC00000000FCFCFC, // 120
-    0xFC00000000FCFC00, // 121
-    0xFC00000000FC00FC, // 122
-    0xFC00000000FC0000, // 123
-    0xFC0000000000FCFC, // 124
-    0xFC0000000000FC00, // 125
-    0xFC000000000000FC, // 126
-    0xFC00000000000000, // 127
-    0x00FCFCFCFCFCFCFC, // 128
-    0x00FCFCFCFCFCFC00, // 129
-    0x00FCFCFCFCFC00FC, // 130
-    0x00FCFCFCFCFC0000, // 131
-    0x00FCFCFCFC00FCFC, // 132
-    0x00FCFCFCFC00FC00, // 133
-    0x00FCFCFCFC0000FC, // 134
-    0x00FCFCFCFC000000, // 135
-    0x00FCFCFC00FCFCFC, // 136
-    0x00FCFCFC00FCFC00, // 137
-    0x00FCFCFC00FC00FC, // 138
-    0x00FCFCFC00FC0000, // 139
-    0x00FCFCFC0000FCFC, // 140
-    0x00FCFCFC0000FC00, // 141
-    0x00FCFCFC000000FC, // 142
-    0x00FCFCFC00000000, // 143
-    0x00FCFC00FCFCFCFC, // 144
-    0x00FCFC00FCFCFC00, // 145
-    0x00FCFC00FCFC00FC, // 146
-    0x00FCFC00FCFC0000, // 147
-    0x00FCFC00FC00FCFC, // 148
-    0x00FCFC00FC00FC00, // 149
-    0x00FCFC00FC0000FC, // 150
-    0x00FCFC00FC000000, // 151
-    0x00FCFC0000FCFCFC, // 152
-    0x00FCFC0000FCFC00, // 153
-    0x00FCFC0000FC00FC, // 154
-    0x00FCFC0000FC0000, // 155
-    0x00FCFC000000FCFC, // 156
-    0x00FCFC000000FC00, // 157
-    0x00FCFC00000000FC, // 158
-    0x00FCFC0000000000, // 159
-    0x00FC00FCFCFCFCFC, // 160
-    0x00FC00FCFCFCFC00, // 161
-    0x00FC00FCFCFC00FC, // 162
-    0x00FC00FCFCFC0000, // 163
-    0x00FC00FCFC00FCFC, // 164
-    0x00FC00FCFC00FC00, // 165
-    0x00FC00FCFC0000FC, // 166
-    0x00FC00FCFC000000, // 167
-    0x00FC00FC00FCFCFC, // 168
-    0x00FC00FC00FCFC00, // 169
-    0x00FC00FC00FC00FC, // 170
-    0x00FC00FC00FC0000, // 171
-    0x00FC00FC0000FCFC, // 172
-    0x00FC00FC0000FC00, // 173
-    0x00FC00FC000000FC, // 174
-    0x00FC00FC00000000, // 175
-    0x00FC0000FCFCFCFC, // 176
-    0x00FC0000FCFCFC00, // 177
-    0x00FC0000FCFC00FC, // 178
-    0x00FC0000FCFC0000, // 179
-    0x00FC0000FC00FCFC, // 180
-    0x00FC0000FC00FC00, // 181
-    0x00FC0000FC0000FC, // 182
-    0x00FC0000FC000000, // 183
-    0x00FC000000FCFCFC, // 184
-    0x00FC000000FCFC00, // 185
-    0x00FC000000FC00FC, // 186
-    0x00FC000000FC0000, // 187
-    0x00FC00000000FCFC, // 188
-    0x00FC00000000FC00, // 189
-    0x00FC0000000000FC, // 190
-    0x00FC000000000000, // 191
-    0x0000FCFCFCFCFCFC, // 192
-    0x0000FCFCFCFCFC00, // 193
-    0x0000FCFCFCFC00FC, // 194
-    0x0000FCFCFCFC0000, // 195
-    0x0000FCFCFC00FCFC, // 196
-    0x0000FCFCFC00FC00, // 197
-    0x0000FCFCFC0000FC, // 198
-    0x0000FCFCFC000000, // 199
-    0x0000FCFC00FCFCFC, // 200
-    0x0000FCFC00FCFC00, // 201
-    0x0000FCFC00FC00FC, // 202
-    0x0000FCFC00FC0000, // 203
-    0x0000FCFC0000FCFC, // 204
-    0x0000FCFC0000FC00, // 205
-    0x0000FCFC000000FC, // 206
-    0x0000FCFC00000000, // 207
-    0x0000FC00FCFCFCFC, // 208
-    0x0000FC00FCFCFC00, // 209
-    0x0000FC00FCFC00FC, // 210
-    0x0000FC00FCFC0000, // 211
-    0x0000FC00FC00FCFC, // 212
-    0x0000FC00FC00FC00, // 213
-    0x0000FC00FC0000FC, // 214
-    0x0000FC00FC000000, // 215
-    0x0000FC0000FCFCFC, // 216
-    0x0000FC0000FCFC00, // 217
-    0x0000FC0000FC00FC, // 218
-    0x0000FC0000FC0000, // 219
-    0x0000FC000000FCFC, // 220
-    0x0000FC000000FC00, // 221
-    0x0000FC00000000FC, // 222
-    0x0000FC0000000000, // 223
-    0x000000FCFCFCFCFC, // 224
-    0x000000FCFCFCFC00, // 225
-    0x000000FCFCFC00FC, // 226
-    0x000000FCFCFC0000, // 227
-    0x000000FCFC00FCFC, // 228
-    0x000000FCFC00FC00, // 229
-    0x000000FCFC0000FC, // 230
-    0x000000FCFC000000, // 231
-    0x000000FC00FCFCFC, // 232
-    0x000000FC00FCFC00, // 233
-    0x000000FC00FC00FC, // 234
-    0x000000FC00FC0000, // 235
-    0x000000FC0000FCFC, // 236
-    0x000000FC0000FC00, // 237
-    0x000000FC000000FC, // 238
-    0x000000FC00000000, // 239
-    0x00000000FCFCFCFC, // 240
-    0x00000000FCFCFC00, // 241
-    0x00000000FCFC00FC, // 242
-    0x00000000FCFC0000, // 243
-    0x00000000FC00FCFC, // 244
-    0x00000000FC00FC00, // 245
-    0x00000000FC0000FC, // 246
-    0x00000000FC000000, // 247
-    0x0000000000FCFCFC, // 248
-    0x0000000000FCFC00, // 249
-    0x0000000000FC00FC, // 250
-    0x0000000000FC0000, // 251
-    0x000000000000FCFC, // 252
-    0x000000000000FC00, // 253
-    0x00000000000000FC, // 254
-    0x0000000000000000, // 255
-};
 
 ////////////////////////////////////////////////////////////////////////////////
