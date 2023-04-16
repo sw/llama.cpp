@@ -1339,9 +1339,9 @@ static void dequantize_row_q3_0(const void * restrict vx, float * restrict y, in
     for (int i = 0; i < nb; i++) {
         const float d = GGML_FP16_TO_FP32(x[i].d);
         uint_fast32_t lo = x[i].qlo;
-        uint_fast16_t hi = x[i].qhi;
+        uint_fast32_t hi = x[i].qhi << 2;
         for (int l = 0; l < 16; l++) {
-            const int8_t vi = (lo & 3) | ((hi & 1) << 2);
+            const int8_t vi = (lo & 3) | (hi & 4);
             const float v = (vi - 4)*d;
             y[i*16 + l] = v;
             assert(!isnan(y[i*16 + l]));
@@ -2342,12 +2342,12 @@ static void ggml_vec_dot_q3_0_q8_0(const int n, float * restrict s, const void *
         const float d1 = y[i/2].d;
 
         uint_fast32_t lo0 = x[i].qlo;
-        uint_fast16_t hi0 = x[i].qhi;
+        uint_fast32_t hi0 = x[i].qhi << 2;
         const int8_t * restrict p1 = y[i/2].qs + (i%2)*QK3_0;
 
         int sumi = 0;
         for (int l = 0; l < 16; l++) {
-            const int8_t i0 = (int8_t)(((lo0 & 3) | ((hi0 & 1) << 2)) - 4);
+            const int8_t i0 = (int8_t)((lo0 & 3) | ((hi0 & 4) - 4));
             const int_fast16_t i1 = p1[l];
 
             sumi += i0 * i1;
@@ -11605,9 +11605,9 @@ size_t ggml_quantize_q3_0(const float * src, void * dst, int n, int k, int64_t h
 
         for (int i = 0; i < 16; i++) {
             uint_fast32_t lo = y[i].qlo;
-            uint_fast16_t hi = y[i].qhi;
+            uint_fast32_t hi = y[i].qhi << 2;
             for (int l = 0; l < 16; l++) {
-                int8_t vi = (lo & 3) | ((hi & 1) << 2);
+                int8_t vi = (lo & 3) | (hi & 4);
                 hist[vi]++;
                 lo >>= 2;
                 hi >>= 1;
