@@ -694,8 +694,8 @@ static void quantize_row_q3_0(const float * restrict x, block_q3_0 * restrict y,
         uint32_t lo = 0;
         uint16_t hi = 0;
 
-        for (int l = 0; l < 16; l++) {
-            const float v = x[i*16 + l]*id;
+        for (int l = 0; l < QK3_0; l++) {
+            const float v = x[i*QK3_0 + l]*id;
             const uint8_t vi = MIN(7, (int8_t)roundf(v) + 4);
             assert(vi < 8);
             lo |= (vi & 3) << (l * 2);
@@ -1340,11 +1340,11 @@ static void dequantize_row_q3_0(const void * restrict vx, float * restrict y, in
         const float d = GGML_FP16_TO_FP32(x[i].d);
         uint_fast32_t lo = x[i].qlo;
         uint_fast32_t hi = x[i].qhi << 2;
-        for (int l = 0; l < 16; l++) {
+        for (int l = 0; l < QK3_0; l++) {
             const int8_t vi = (lo & 3) | (hi & 4);
             const float v = (vi - 4)*d;
-            y[i*16 + l] = v;
-            assert(!isnan(y[i*16 + l]));
+            y[i*QK3_0 + l] = v;
+            assert(!isnan(y[i*QK3_0 + l]));
             lo >>= 2;
             hi >>= 1;
         }
@@ -2359,7 +2359,7 @@ static void ggml_vec_dot_q3_0_q8_0(const int n, float * restrict s, const void *
         const int8_t * restrict p1 = y[i/2].qs + (i%2)*QK3_0;
 
         int sumi = 0;
-        for (int l = 0; l < 16; l++) {
+        for (int l = 0; l < QK3_0; l++) {
             const int8_t i0 = (int8_t)((lo0 & 3) | ((hi0 & 4) - 4));
             const int_fast16_t i1 = p1[l];
 
@@ -11610,16 +11610,17 @@ size_t ggml_quantize_q2_0(const float * src, void * dst, int n, int k, int64_t h
 
 size_t ggml_quantize_q3_0(const float * src, void * dst, int n, int k, int64_t hist[1<<3]) {
     assert(k % QK3_0 == 0);
+    const int nb = k / QK3_0;
 
     for (int j = 0; j < n; j += k) {
         block_q3_0 * restrict y = (block_q3_0 *)dst + j/QK3_0;
 
         quantize_row_q3_0(src + j, y, k);
 
-        for (int i = 0; i < 16; i++) {
+        for (int i = 0; i < nb; i++) {
             uint_fast32_t lo = y[i].qlo;
             uint_fast32_t hi = y[i].qhi << 2;
-            for (int l = 0; l < 16; l++) {
+            for (int l = 0; l < QK3_0; l++) {
                 int8_t vi = (lo & 3) | (hi & 4);
                 hist[vi]++;
                 lo >>= 2;
