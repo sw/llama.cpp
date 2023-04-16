@@ -608,8 +608,10 @@ static_assert(sizeof(block_q2_0) == sizeof(ggml_fp16_t) + QK2_0 / 4, "wrong q2_0
 #define QK3_0 16
 typedef struct {
     ggml_fp16_t d;
-    uint16_t qhi;
-    uint32_t qlo;
+    // Instead of representing q3_0 as a packed format "...210210210210",
+    // represent it as two planes: "...10101010" and "...2222"
+    uint16_t qhi; // The highest bit of each 3-bit number, packed together
+    uint32_t qlo; // The low 2-bits of each 3-bit number, packed together
 } block_q3_0;
 static_assert(sizeof(block_q3_0) == sizeof(ggml_fp16_t) + QK3_0 * 3 / 8, "wrong q3_0 size/padding");
 
