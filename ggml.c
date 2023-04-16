@@ -2243,19 +2243,20 @@ static void ggml_vec_dot_q2_0_q8_0(const int n, float * restrict s, const void *
     // Initialize accumulator with zeros
     __m256 acc = _mm256_setzero_ps();
 
-    for (int i = 0; i < nb; i += 2) {
-        __m256i bx = bytesFromCrumbs(x[i+1].qs, x[i].qs);
+    for (int i = 0; i < nb/2; i++) {
+        __m256i bx = bytesFromCrumbs(x[i*2+1].qs, x[i*2].qs);
 
         // Compute combined scale for the block
-        const __m128 scale_lo = _mm_set1_ps(GGML_FP16_TO_FP32(x[i+0].d) * y[i/2].d);
-        const __m128 scale_hi = _mm_set1_ps(GGML_FP16_TO_FP32(x[i+1].d) * y[i/2].d);
-        const __m256 scale = _mm256_set_m128(scale_hi, scale_lo);
+        const __m128 scale_lo = _mm_set1_ps(GGML_FP16_TO_FP32(x[i*2+0].d));
+        const __m128 scale_hi = _mm_set1_ps(GGML_FP16_TO_FP32(x[i*2+1].d));
+        __m256 scale = _mm256_set_m128(scale_hi, scale_lo);
+        scale = _mm256_mul_ps(scale, _mm256_broadcast_ss(&y[i].d));
 
         const __m256i off = _mm256_set1_epi8(2);
         bx = _mm256_sub_epi8(bx, off);
 
         // Load y vector
-        const __m256i by = _mm256_loadu_si256((const __m256i *)y[i/2].qs);
+        const __m256i by = _mm256_loadu_si256((const __m256i *)y[i].qs);
 
         // Do the product:
         __m256 p = dotMul256i(bx, by);
@@ -2295,6 +2296,7 @@ static const uint64_t ggml_q3_table[256];
 static void ggml_vec_dot_q3_0_q8_0(const int n, float * restrict s, const void * restrict vx, const void * restrict vy) {
     assert(n % QK3_0 == 0);
     const int nb = n / QK3_0;
+    assert(nb % 2 == 0);
 
     const block_q3_0 * restrict x = vx;
     const block_q8_0 * restrict y = vy;
