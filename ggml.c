@@ -606,12 +606,10 @@ typedef struct {
 static_assert(sizeof(block_q2_0) == sizeof(ggml_fp16_t) + QK2_0 / 4, "wrong q2_0 size/padding");
 
 #define QK3_0 16
-typedef union {
-    struct {
-        uint16_t    pad[3];
-        ggml_fp16_t d;
-    };
-    uint64_t qs;
+typedef struct {
+    ggml_fp16_t d;
+    uint16_t qhi;
+    uint32_t qlo;
 } block_q3_0;
 static_assert(sizeof(block_q3_0) == sizeof(ggml_fp16_t) + QK3_0 * 3 / 8, "wrong q3_0 size/padding");
 
@@ -691,17 +689,20 @@ static void quantize_row_q3_0(const float * restrict x, block_q3_0 * restrict y,
         const float d = max / -4;
         const float id = d ? 1.0f/d : 0.0f;
 
-        uint64_t qs = 0;
+        uint32_t lo = 0;
+        uint16_t hi = 0;
 
-        for (int l = 0; l < QK3_0; l++) {
-            const float v = x[i*QK3_0 + l]*id;
+        for (int l = 0; l < 16; l++) {
+            const float v = x[i*16 + l]*id;
             const uint8_t vi = MIN(7, (int8_t)roundf(v) + 4);
             assert(vi < 8);
-            qs |= (uint64_t)vi << (l*3);
+            lo |= (vi & 3) << (l * 2);
+            hi |= ((vi >> 2) & 1) << l;
         }
 
-        y[i].qs = qs;
-        y[i].d = GGML_FP32_TO_FP16(d);  // overwrite unused part of uint64_t qs
+        y[i].d = GGML_FP32_TO_FP16(d);
+        y[i].qlo = lo;
+        y[i].qhi = hi;
     }
 }
 
@@ -1335,13 +1336,15 @@ static void dequantize_row_q3_0(const void * restrict vx, float * restrict y, in
 
     for (int i = 0; i < nb; i++) {
         const float d = GGML_FP16_TO_FP32(x[i].d);
-        uint64_t qs = x[i].qs;
-        for (int l = 0; l < QK3_0; l++) {
-            const int8_t vi = qs & 7;
+        uint_fast32_t lo = x[i].qlo;
+        uint_fast16_t hi = x[i].qhi;
+        for (int l = 0; l < 16; l++) {
+            const int8_t vi = (lo & 3) | ((hi & 1) << 2);
             const float v = (vi - 4)*d;
-            y[i*QK3_0 + l] = v;
-            assert(!isnan(y[i*QK3_0 + l]));
-            qs >>= 3;
+            y[i*16 + l] = v;
+            assert(!isnan(y[i*16 + l]));
+            lo >>= 2;
+            hi >>= 1;
         }
     }
 }
@@ -2193,6 +2196,39 @@ inline static void ggml_vec_dot_f16(const int n, float * restrict s, ggml_fp16_t
     *s = sumf;
 }
 
+#if __AVX2__ || __AVX512F__
+// Computes the dot product of signed 8-bit integers packed into 256-bit vectors,
+// converting the result to 32-bit floats packed into a 256-bit vector.
+static inline __m256 dotMul256i(__m256i bx, __m256i by) {
+#  if __AVXVNNIINT8__
+    // Perform multiplication and sum to 32-bit values
+    const __m256i i32 = _mm256_dpbssd_epi32(bx, by, _mm256_setzero_si256());
+#  else
+    // Get absolute values of x vectors
+    const __m256i ax = _mm256_sign_epi8(bx, bx);
+    // Sign the values of the y vectors
+    const __m256i sy = _mm256_sign_epi8(by, bx);
+    // Perform multiplication and create 16-bit values
+    const __m256i dot = _mm256_maddubs_epi16(ax, sy);
+
+    // Convert int16_t to int32_t by adding pairwise
+    const __m256i ones = _mm256_set1_epi16(1);
+    const __m256i i32 = _mm256_madd_epi16(ones, dot);
+#  endif
+    // Convert int32_t to float
+    return _mm256_cvtepi32_ps(i32);
+}
+
+// Return horizontal sum of the 32-bit floats packed into a 256-bit vector.
+static inline float horizontalSum(__m256 acc) {
+    __m128 res = _mm256_extractf128_ps(acc, 1);
+    res = _mm_add_ps(res, _mm256_castps256_ps128(acc));
+    res = _mm_add_ps(res, _mm_movehl_ps(res, res));
+    res = _mm_add_ss(res, _mm_movehdup_ps(res));
+    return _mm_cvtss_f32(res);
+}
+#endif
+
 static void ggml_vec_dot_q2_0_q8_0(const int n, float * restrict s, const void * restrict vx, const void * restrict vy) {
     assert(n % QK2_0 == 0);
     const int nb = n / QK2_0;
@@ -2221,30 +2257,15 @@ static void ggml_vec_dot_q2_0_q8_0(const int n, float * restrict s, const void *
         // Load y vector
         const __m256i by = _mm256_loadu_si256((const __m256i *)y[i/2].qs);
 
-        // Get absolute values of x vectors
-        const __m256i ax = _mm256_sign_epi8(bx, bx);
-        // Sign the values of the y vectors
-        const __m256i sy = _mm256_sign_epi8(by, bx);
-        // Perform multiplication and create 16-bit values
-        const __m256i dot = _mm256_maddubs_epi16(ax, sy);
-
-        // Convert int16_t to int32_t by adding pairwise
-        const __m256i ones = _mm256_set1_epi16(1);
-        __m256i i32 = _mm256_madd_epi16(ones, dot);
-
-        // Convert int32_t to float
-        __m256 p = _mm256_cvtepi32_ps(i32);
+        // Do the product:
+        __m256 p = dotMul256i(bx, by);
 
         // Apply the scale, and accumulate
         acc = _mm256_fmadd_ps(scale, p, acc);
     }
 
     // Return horizontal sum of the acc vector
-    __m128 res = _mm256_extractf128_ps(acc, 1);
-    res = _mm_add_ps(res, _mm256_castps256_ps128(acc));
-    res = _mm_add_ps(res, _mm_movehl_ps(res, res));
-    res = _mm_add_ss(res, _mm_movehdup_ps(res));
-    sumf = _mm_cvtss_f32(res);
+    sumf = horizontalSum(acc);
 #else
     for (int i = 0; i < nb; i++) {
         const float d0 = GGML_FP16_TO_FP32(x[i].d);
@@ -2269,6 +2290,8 @@ static void ggml_vec_dot_q2_0_q8_0(const int n, float * restrict s, const void *
     *s = sumf;
 }
 
+static const uint64_t ggml_q3_table[256];
+
 static void ggml_vec_dot_q3_0_q8_0(const int n, float * restrict s, const void * restrict vx, const void * restrict vy) {
     assert(n % QK3_0 == 0);
     const int nb = n / QK3_0;
@@ -2280,100 +2303,53 @@ static void ggml_vec_dot_q3_0_q8_0(const int n, float * restrict s, const void *
 
 #if defined(__AVX2__)
     // Initialize accumulator with zeros
-    __m128 acc = _mm_setzero_ps();
-    for (int i = 0; i < nb; i++) {
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb; i += 2) {
+        __m256i const bxhi = _mm256_set_epi64x(
+            ggml_q3_table[x[i+1].qhi >> 8], ggml_q3_table[x[i+1].qhi & 0xFF],
+            ggml_q3_table[x[i+0].qhi >> 8], ggml_q3_table[x[i+0].qhi & 0xFF]);
+
+        __m256i bx = bytesFromCrumbs(x[i+1].qlo, x[i].qlo);
+
+        // OR the high bits (which also handles the sign):
+        bx = _mm256_or_si256(bx, bxhi);
+
         // Compute combined scale for the block
-        const __m128 scale = _mm_set1_ps(GGML_FP16_TO_FP32(x[i].d) * y[i/2].d);
+        const __m128 scale_lo = _mm_set1_ps(GGML_FP16_TO_FP32(x[i+0].d) * y[i/2].d);
+        const __m128 scale_hi = _mm_set1_ps(GGML_FP16_TO_FP32(x[i+1].d) * y[i/2].d);
+        const __m256 scale = _mm256_set_m128(scale_hi, scale_lo);
 
-        const __m256i shift_l = _mm256_set_epi64x(2*3,  64, 4*3,  0);
-        const __m256i shift_r = _mm256_set_epi64x( 64, 2*3,  64, 64);
+        // Load y vector
+        const __m256i by = _mm256_loadu_si256((const __m256i *)y[i/2].qs);
 
-        __m256i bxx = _mm256_set1_epi64x(x[i].qs);
-
-        // legend:    _=zero    +=one    .=don't care    0-f=3bit quantized values    s=fp16 scale
-
-        // shift the copies to be able to reach all values
-        // 255               192                  128                   64                    0
-        //                     |                    |                    |                    |
-        // sssssfedcba9876543210sssssfedcba9876543210sssssfedcba9876543210sssssfedcba9876543210  in
-        // sssfedcba9876543210_______________________sfedcba9876543210____sssssfedcba9876543210  shift left
-        // _______________________sssssfedcba98765432__________________________________________  shift right
-        // sssfedcba9876543210____sssssfedcba98765432sfedcba9876543210____sssssfedcba9876543210  out
-        //     ^  ^    ^  ^    ^    ^  ^    ^  ^    ^    ^  ^    ^  ^    ^    ^  ^    ^  ^    ^
-        //     e  b    6  3    _    .  f    a  7    2    c  9    4  1    _    .  d    8  5    0
-        bxx = _mm256_or_si256(_mm256_sllv_epi64(bxx, shift_l), _mm256_srlv_epi64(bxx, shift_r));
-
-        // add to itself in masked places to shift some values left one bit
-        // 127                                                           64                                                               0
-        //        |       |       |       |       |       |       |       |       |       |       |       |       |       |       |       |
-        // ssssfffeeedddcccbbbaaa999888777666555444333222111000____________ssssssssssssssssfffeeedddcccbbbaaa999888777666555444333222111000  in
-        // _____________________++++____________________++++____________________________________++++____________________++++_______________  mask
-        // _____________________.999____________________.111____________________________________.ddd____________________.555_______________  masked
-        // .............ccc.....999.............444.....111....____________.....................ddd.............888.....555.............000  sum
-        //
-        // 255                                                          192                                                             128
-        //        |       |       |       |       |       |       |       |       |       |       |       |       |       |       |       |
-        // ssssssssssfffeeedddcccbbbaaa999888777666555444333222111000____________ssssssssssssssssfffeeedddcccbbbaaa999888777666555444333222  in
-        // _____________________++++____________________++++____________________________________++++____________________++++_______________  mask
-        // _____________________.bbb____________________.333____________________________________.fff____________________.777_______________  masked
-        // .............eee.....bbb.............666.....333..........____________...............fff.............aaa.....777.............222  sum
-        const __m256i doublemask = _mm256_set1_epi64x(0x078000078000);
-        bxx = _mm256_add_epi64(bxx, _mm256_and_si256(doublemask, bxx));
-
-        // collect 16 bytes from 256 into 128 bits
-        const __m256i shufmask = _mm256_set_epi8(
-             5,14,-1,-1,13, 3,-1,-1, 2,11,-1,-1,10, 0,-1,-1,
-            -1,-1, 5,14,-1,-1,13, 3,-1,-1, 2,11,-1,-1,10, 0);
-        bxx = _mm256_shuffle_epi8(bxx, shufmask);
-
-        __m128i bx = _mm_or_si128(_mm256_castsi256_si128(bxx), _mm256_extracti128_si256(bxx, 1));
-
-        const __m128i mask = _mm_set1_epi8(7);
-        bx = _mm_and_si128(mask, bx);
-
-        const __m128i off = _mm_set1_epi8(4);
-        bx = _mm_sub_epi8(bx, off);
-
-        const __m128i by = _mm_loadu_si128((const __m128i *)(y[i/2].qs + (i%2)*QK3_0));
-
-        // Get absolute values of x vectors
-        const __m128i ax = _mm_sign_epi8(bx, bx);
-        // Sign the values of the y vectors
-        const __m128i sy = _mm_sign_epi8(by, bx);
-        // Perform multiplication and create 16-bit values
-        const __m128i dot = _mm_maddubs_epi16(ax, sy);
-
-        // Convert int16_t to int32_t by adding pairwise
-        const __m128i ones = _mm_set1_epi16(1);
-        __m128i i32 = _mm_madd_epi16(dot, ones);
-
-        // Convert int32_t to float
-        const __m128 p = _mm_cvtepi32_ps(i32);
+        // Do the product,
+        __m256 p = dotMul256i(bx, by);
 
         // Apply the scale, and accumulate
-        acc = _mm_fmadd_ps(scale, p, acc);
+        acc = _mm256_fmadd_ps(scale, p, acc);
     }
 
     // Return horizontal sum of the acc vector
-    __m128 res = _mm_add_ps(acc, _mm_movehl_ps(acc, acc));
-    res = _mm_add_ss(res, _mm_movehdup_ps(res));
-    sumf = _mm_cvtss_f32(res);
+    sumf = horizontalSum(acc);
 #else
     for (int i = 0; i < nb; i++) {
         const float d0 = GGML_FP16_TO_FP32(x[i].d);
         const float d1 = y[i/2].d;
 
-        uint64_t qs0 = x[i].qs;
+        uint_fast32_t lo0 = x[i].qlo;
+        uint_fast16_t hi0 = x[i].qhi;
         const int8_t * restrict p1 = y[i/2].qs + (i%2)*QK3_0;
 
         int sumi = 0;
-        for (int j = 0; j < QK3_0; j++) {
-            const int8_t i0 = (int8_t)(qs0 & 7) - 4;
-            const int_fast16_t i1 = p1[j];
+        for (int l = 0; l < 16; l++) {
+            const int8_t i0 = (int8_t)(((lo0 & 3) | ((hi0 & 1) << 2)) - 4);
+            const int_fast16_t i1 = p1[l];
 
             sumi += i0 * i1;
 
-            qs0 >>= 3;
+            lo0 >>= 2;
+            hi0 >>= 1;
         }
         sumf += d0 * d1 * sumi;
     }
@@ -11617,19 +11593,20 @@ size_t ggml_quantize_q2_0(const float * src, void * dst, int n, int k, int64_t h
 
 size_t ggml_quantize_q3_0(const float * src, void * dst, int n, int k, int64_t hist[1<<3]) {
     assert(k % QK3_0 == 0);
-    const int nb = k / QK3_0;
 
     for (int j = 0; j < n; j += k) {
         block_q3_0 * restrict y = (block_q3_0 *)dst + j/QK3_0;
 
         quantize_row_q3_0(src + j, y, k);
 
-        for (int i = 0; i < nb; i++) {
-            uint64_t qs = y[i].qs;
-            for (int l = 0; l < QK3_0; l++) {
-                const int8_t vi = qs & 7;
+        for (int i = 0; i < 16; i++) {
+            uint_fast32_t lo = y[i].qlo;
+            uint_fast16_t hi = y[i].qhi;
+            for (int l = 0; l < 16; l++) {
+                int8_t vi = (lo & 3) | ((hi & 1) << 2);
                 hist[vi]++;
-                qs >>= 3;
+                lo >>= 2;
+                hi >>= 1;
             }
         }
     }
@@ -11780,5 +11757,280 @@ int ggml_cpu_has_vsx(void) {
     return 0;
 #endif
 }
+
+////////////////////////////////////////////////////////////////////////////////
+
+/*
+* Lookup table used to convert q3_0 to SIMD vectors.
+* Expands the bits of an 8-bit value into a 64 bit result, turning each bit into a byte.
+* A zero bit turns into 0xFC, while a one bit turns into 0x00.
+* The code to generate this table is:
+for(int i = 0; i < 256; i++)
+{
+    uint64_t v = 0;
+    for(int j = 0; j < 8; j++)
+        if(!(i & (1 << j)))
+            v |= 0xFCul << (8 * j);
+    printf("    0x%016lX,// %i\n", v, i);
+}
+*/
+static const uint64_t ggml_q3_table[256] = {
+    0xFCFCFCFCFCFCFCFC, // 0
+    0xFCFCFCFCFCFCFC00, // 1
+    0xFCFCFCFCFCFC00FC, // 2
+    0xFCFCFCFCFCFC0000, // 3
+    0xFCFCFCFCFC00FCFC, // 4
+    0xFCFCFCFCFC00FC00, // 5
+    0xFCFCFCFCFC0000FC, // 6
+    0xFCFCFCFCFC000000, // 7
+    0xFCFCFCFC00FCFCFC, // 8
+    0xFCFCFCFC00FCFC00, // 9
+    0xFCFCFCFC00FC00FC, // 10
+    0xFCFCFCFC00FC0000, // 11
+    0xFCFCFCFC0000FCFC, // 12
+    0xFCFCFCFC0000FC00, // 13
+    0xFCFCFCFC000000FC, // 14
+    0xFCFCFCFC00000000, // 15
+    0xFCFCFC00FCFCFCFC, // 16
+    0xFCFCFC00FCFCFC00, // 17
+    0xFCFCFC00FCFC00FC, // 18
+    0xFCFCFC00FCFC0000, // 19
+    0xFCFCFC00FC00FCFC, // 20
+    0xFCFCFC00FC00FC00, // 21
+    0xFCFCFC00FC0000FC, // 22
+    0xFCFCFC00FC000000, // 23
+    0xFCFCFC0000FCFCFC, // 24
+    0xFCFCFC0000FCFC00, // 25
+    0xFCFCFC0000FC00FC, // 26
+    0xFCFCFC0000FC0000, // 27
+    0xFCFCFC000000FCFC, // 28
+    0xFCFCFC000000FC00, // 29
+    0xFCFCFC00000000FC, // 30
+    0xFCFCFC0000000000, // 31
+    0xFCFC00FCFCFCFCFC, // 32
+    0xFCFC00FCFCFCFC00, // 33
+    0xFCFC00FCFCFC00FC, // 34
+    0xFCFC00FCFCFC0000, // 35
+    0xFCFC00FCFC00FCFC, // 36
+    0xFCFC00FCFC00FC00, // 37
+    0xFCFC00FCFC0000FC, // 38
+    0xFCFC00FCFC000000, // 39
+    0xFCFC00FC00FCFCFC, // 40
+    0xFCFC00FC00FCFC00, // 41
+    0xFCFC00FC00FC00FC, // 42
+    0xFCFC00FC00FC0000, // 43
+    0xFCFC00FC0000FCFC, // 44
+    0xFCFC00FC0000FC00, // 45
+    0xFCFC00FC000000FC, // 46
+    0xFCFC00FC00000000, // 47
+    0xFCFC0000FCFCFCFC, // 48
+    0xFCFC0000FCFCFC00, // 49
+    0xFCFC0000FCFC00FC, // 50
+    0xFCFC0000FCFC0000, // 51
+    0xFCFC0000FC00FCFC, // 52
+    0xFCFC0000FC00FC00, // 53
+    0xFCFC0000FC0000FC, // 54
+    0xFCFC0000FC000000, // 55
+    0xFCFC000000FCFCFC, // 56
+    0xFCFC000000FCFC00, // 57
+    0xFCFC000000FC00FC, // 58
+    0xFCFC000000FC0000, // 59
+    0xFCFC00000000FCFC, // 60
+    0xFCFC00000000FC00, // 61
+    0xFCFC0000000000FC, // 62
+    0xFCFC000000000000, // 63
+    0xFC00FCFCFCFCFCFC, // 64
+    0xFC00FCFCFCFCFC00, // 65
+    0xFC00FCFCFCFC00FC, // 66
+    0xFC00FCFCFCFC0000, // 67
+    0xFC00FCFCFC00FCFC, // 68
+    0xFC00FCFCFC00FC00, // 69
+    0xFC00FCFCFC0000FC, // 70
+    0xFC00FCFCFC000000, // 71
+    0xFC00FCFC00FCFCFC, // 72
+    0xFC00FCFC00FCFC00, // 73
+    0xFC00FCFC00FC00FC, // 74
+    0xFC00FCFC00FC0000, // 75
+    0xFC00FCFC0000FCFC, // 76
+    0xFC00FCFC0000FC00, // 77
+    0xFC00FCFC000000FC, // 78
+    0xFC00FCFC00000000, // 79
+    0xFC00FC00FCFCFCFC, // 80
+    0xFC00FC00FCFCFC00, // 81
+    0xFC00FC00FCFC00FC, // 82
+    0xFC00FC00FCFC0000, // 83
+    0xFC00FC00FC00FCFC, // 84
+    0xFC00FC00FC00FC00, // 85
+    0xFC00FC00FC0000FC, // 86
+    0xFC00FC00FC000000, // 87
+    0xFC00FC0000FCFCFC, // 88
+    0xFC00FC0000FCFC00, // 89
+    0xFC00FC0000FC00FC, // 90
+    0xFC00FC0000FC0000, // 91
+    0xFC00FC000000FCFC, // 92
+    0xFC00FC000000FC00, // 93
+    0xFC00FC00000000FC, // 94
+    0xFC00FC0000000000, // 95
+    0xFC0000FCFCFCFCFC, // 96
+    0xFC0000FCFCFCFC00, // 97
+    0xFC0000FCFCFC00FC, // 98
+    0xFC0000FCFCFC0000, // 99
+    0xFC0000FCFC00FCFC, // 100
+    0xFC0000FCFC00FC00, // 101
+    0xFC0000FCFC0000FC, // 102
+    0xFC0000FCFC000000, // 103
+    0xFC0000FC00FCFCFC, // 104
+    0xFC0000FC00FCFC00, // 105
+    0xFC0000FC00FC00FC, // 106
+    0xFC0000FC00FC0000, // 107
+    0xFC0000FC0000FCFC, // 108
+    0xFC0000FC0000FC00, // 109
+    0xFC0000FC000000FC, // 110
+    0xFC0000FC00000000, // 111
+    0xFC000000FCFCFCFC, // 112
+    0xFC000000FCFCFC00, // 113
+    0xFC000000FCFC00FC, // 114
+    0xFC000000FCFC0000, // 115
+    0xFC000000FC00FCFC, // 116
+    0xFC000000FC00FC00, // 117
+    0xFC000000FC0000FC, // 118
+    0xFC000000FC000000, // 119
+    0xFC00000000FCFCFC, // 120
+    0xFC00000000FCFC00, // 121
+    0xFC00000000FC00FC, // 122
+    0xFC00000000FC0000, // 123
+    0xFC0000000000FCFC, // 124
+    0xFC0000000000FC00, // 125
+    0xFC000000000000FC, // 126
+    0xFC00000000000000, // 127
+    0x00FCFCFCFCFCFCFC, // 128
+    0x00FCFCFCFCFCFC00, // 129
+    0x00FCFCFCFCFC00FC, // 130
+    0x00FCFCFCFCFC0000, // 131
+    0x00FCFCFCFC00FCFC, // 132
+    0x00FCFCFCFC00FC00, // 133
+    0x00FCFCFCFC0000FC, // 134
+    0x00FCFCFCFC000000, // 135
+    0x00FCFCFC00FCFCFC, // 136
+    0x00FCFCFC00FCFC00, // 137
+    0x00FCFCFC00FC00FC, // 138
+    0x00FCFCFC00FC0000, // 139
+    0x00FCFCFC0000FCFC, // 140
+    0x00FCFCFC0000FC00, // 141
+    0x00FCFCFC000000FC, // 142
+    0x00FCFCFC00000000, // 143
+    0x00FCFC00FCFCFCFC, // 144
+    0x00FCFC00FCFCFC00, // 145
+    0x00FCFC00FCFC00FC, // 146
+    0x00FCFC00FCFC0000, // 147
+    0x00FCFC00FC00FCFC, // 148
+    0x00FCFC00FC00FC00, // 149
+    0x00FCFC00FC0000FC, // 150
+    0x00FCFC00FC000000, // 151
+    0x00FCFC0000FCFCFC, // 152
+    0x00FCFC0000FCFC00, // 153
+    0x00FCFC0000FC00FC, // 154
+    0x00FCFC0000FC0000, // 155
+    0x00FCFC000000FCFC, // 156
+    0x00FCFC000000FC00, // 157
+    0x00FCFC00000000FC, // 158
+    0x00FCFC0000000000, // 159
+    0x00FC00FCFCFCFCFC, // 160
+    0x00FC00FCFCFCFC00, // 161
+    0x00FC00FCFCFC00FC, // 162
+    0x00FC00FCFCFC0000, // 163
+    0x00FC00FCFC00FCFC, // 164
+    0x00FC00FCFC00FC00, // 165
+    0x00FC00FCFC0000FC, // 166
+    0x00FC00FCFC000000, // 167
+    0x00FC00FC00FCFCFC, // 168
+    0x00FC00FC00FCFC00, // 169
+    0x00FC00FC00FC00FC, // 170
+    0x00FC00FC00FC0000, // 171
+    0x00FC00FC0000FCFC, // 172
+    0x00FC00FC0000FC00, // 173
+    0x00FC00FC000000FC, // 174
+    0x00FC00FC00000000, // 175
+    0x00FC0000FCFCFCFC, // 176
+    0x00FC0000FCFCFC00, // 177
+    0x00FC0000FCFC00FC, // 178
+    0x00FC0000FCFC0000, // 179
+    0x00FC0000FC00FCFC, // 180
+    0x00FC0000FC00FC00, // 181
+    0x00FC0000FC0000FC, // 182
+    0x00FC0000FC000000, // 183
+    0x00FC000000FCFCFC, // 184
+    0x00FC000000FCFC00, // 185
+    0x00FC000000FC00FC, // 186
+    0x00FC000000FC0000, // 187
+    0x00FC00000000FCFC, // 188
+    0x00FC00000000FC00, // 189
+    0x00FC0000000000FC, // 190
+    0x00FC000000000000, // 191
+    0x0000FCFCFCFCFCFC, // 192
+    0x0000FCFCFCFCFC00, // 193
+    0x0000FCFCFCFC00FC, // 194
+    0x0000FCFCFCFC0000, // 195
+    0x0000FCFCFC00FCFC, // 196
+    0x0000FCFCFC00FC00, // 197
+    0x0000FCFCFC0000FC, // 198
+    0x0000FCFCFC000000, // 199
+    0x0000FCFC00FCFCFC, // 200
+    0x0000FCFC00FCFC00, // 201
+    0x0000FCFC00FC00FC, // 202
+    0x0000FCFC00FC0000, // 203
+    0x0000FCFC0000FCFC, // 204
+    0x0000FCFC0000FC00, // 205
+    0x0000FCFC000000FC, // 206
+    0x0000FCFC00000000, // 207
+    0x0000FC00FCFCFCFC, // 208
+    0x0000FC00FCFCFC00, // 209
+    0x0000FC00FCFC00FC, // 210
+    0x0000FC00FCFC0000, // 211
+    0x0000FC00FC00FCFC, // 212
+    0x0000FC00FC00FC00, // 213
+    0x0000FC00FC0000FC, // 214
+    0x0000FC00FC000000, // 215
+    0x0000FC0000FCFCFC, // 216
+    0x0000FC0000FCFC00, // 217
+    0x0000FC0000FC00FC, // 218
+    0x0000FC0000FC0000, // 219
+    0x0000FC000000FCFC, // 220
+    0x0000FC000000FC00, // 221
+    0x0000FC00000000FC, // 222
+    0x0000FC0000000000, // 223
+    0x000000FCFCFCFCFC, // 224
+    0x000000FCFCFCFC00, // 225
+    0x000000FCFCFC00FC, // 226
+    0x000000FCFCFC0000, // 227
+    0x000000FCFC00FCFC, // 228
+    0x000000FCFC00FC00, // 229
+    0x000000FCFC0000FC, // 230
+    0x000000FCFC000000, // 231
+    0x000000FC00FCFCFC, // 232
+    0x000000FC00FCFC00, // 233
+    0x000000FC00FC00FC, // 234
+    0x000000FC00FC0000, // 235
+    0x000000FC0000FCFC, // 236
+    0x000000FC0000FC00, // 237
+    0x000000FC000000FC, // 238
+    0x000000FC00000000, // 239
+    0x00000000FCFCFCFC, // 240
+    0x00000000FCFCFC00, // 241
+    0x00000000FCFC00FC, // 242
+    0x00000000FCFC0000, // 243
+    0x00000000FC00FCFC, // 244
+    0x00000000FC00FC00, // 245
+    0x00000000FC0000FC, // 246
+    0x00000000FC000000, // 247
+    0x0000000000FCFCFC, // 248
+    0x0000000000FCFC00, // 249
+    0x0000000000FC00FC, // 250
+    0x0000000000FC0000, // 251
+    0x000000000000FCFC, // 252
+    0x000000000000FC00, // 253
+    0x00000000000000FC, // 254
+    0x0000000000000000, // 255
+};
 
 ////////////////////////////////////////////////////////////////////////////////
